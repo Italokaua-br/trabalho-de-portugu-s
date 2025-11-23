@@ -1,0 +1,1124 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quiz Literário Angolano</title>
+    <!-- Carregando Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Carregando Google Fonts: Inter -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+    <!-- Configuração de Estilos e Fonte -->
+    <style>
+        :root {
+            --primary-color: #3b82f6; /* Blue 500 */
+            --secondary-color: #ef4444; /* Red 500 */
+        }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f3f4f6; /* Gray 100 */
+        }
+        .container-quiz {
+            box-shadow: 0 0 40px rgba(0, 0, 0, 0.05); /* Sombra mais suave */
+        }
+        .answer-button {
+            transition: all 0.2s;
+            cursor: pointer;
+            min-height: 70px; /* Garante que os botões tenham um bom tamanho para toque */
+            display: flex;
+            align-items: center;
+            justify-content: flex-start;
+            padding: 1rem;
+        }
+        .answer-button:hover:not(.disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+        }
+        .answer-button.selected {
+            border-color: var(--primary-color) !important;
+            background-color: #eff6ff; /* Blue 50 */
+            color: var(--primary-color);
+            font-weight: 600;
+        }
+        .timer-bar-fill {
+            transition: width 1s linear;
+        }
+        /* Estilo para animação de erro/acerto */
+        .shake { animation: shake 0.5s; }
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            20%, 60% { transform: translateX(-10px); }
+            40%, 80% { transform: translateX(10px); }
+        }
+    </style>
+</head>
+
+<body class="min-h-screen flex items-center justify-center p-4">
+
+    <!-- Container Principal do Jogo -->
+    <div id="app-container" class="container-quiz w-full max-w-4xl bg-white rounded-xl p-4 sm:p-6 md:p-10">
+
+        <!-- O conteúdo será renderizado aqui pelo JavaScript -->
+        <div id="game-content" class="min-h-[400px] flex flex-col justify-center items-center text-center">
+            <h1 class="text-3xl font-extrabold text-gray-800 mb-4">Carregando Quiz...</h1>
+            <p class="text-gray-500">Aguarde a inicialização.</p>
+        </div>
+
+    </div>
+
+
+
+
+
+
+    <script type="module">
+        // --- IMPORTS DO FIREBASE ---
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, query, where, getDocs, limit, serverTimestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- CONFIGURAÇÃO DE FALLBACK PARA AMBIENTES LOCAIS (VS CODE) ---
+        // Estas variáveis são injetadas no ambiente Canvas. Se estiver a correr localmente,
+        // o código de fallback garante que a app não crasha.
+        const getGlobal = (name) => window[name];
+
+        const MOCK_API_KEY = "MOCK_API_KEY"; // Chave de API de Mock
+        const defaultFirebaseConfig = {
+            apiKey: MOCK_API_KEY,
+            authDomain: "mock-project.firebaseapp.com",
+            projectId: "mock-project-id",
+            storageBucket: "mock-project.appspot.com",
+            messagingSenderId: "123456789012",
+            appId: "1:123456789012:web:mockwebid"
+        };
+        
+        let firebaseConfig;
+        try {
+            const configString = getGlobal('__firebase_config');
+            firebaseConfig = JSON.parse(configString);
+            // Se a config vier vazia ou incompleta, usamos o mock.
+            if (!firebaseConfig || Object.keys(firebaseConfig).length === 0 || !firebaseConfig.apiKey) {
+                 throw new Error("Config Vazia ou Inválida");
+            }
+        } catch {
+            console.warn("Aviso: A usar configuração Mock do Firebase.");
+            firebaseConfig = defaultFirebaseConfig;
+        }
+
+        const initialAuthToken = getGlobal('__initial_auth_token');
+        const appId = getGlobal('__app_id') || 'default-quiz-app';
+        // ------------------------------------------------------------------
+
+        // Variáveis globais para Firebase e Estado do Jogo
+        let db;
+        let auth;
+        let userId = 'loading'; // ID do usuário, será definido após o login
+        let isAuthReady = false;
+        let isFirestoreReady = false; // Flag para saber se a BD está pronta para uso real (e a API key é válida)
+
+        const GAME_PHASES = {
+            CUSTOMIZATION: 'CUSTOMIZATION',
+            NICKNAME: 'NICKNAME',
+            QUIZ: 'QUIZ',
+            RANKING: 'RANKING'
+        };
+
+        // Estado inicial do personagem
+        const defaultCharacter = { color: '#3b82f6', hat: 'none', facialHair: 'none' };
+        const totalQuestionsCount = 10; // Para uso na lógica de estado
+
+        // Carrega o estado do jogo do localStorage
+        const loadedCharacter = JSON.parse(localStorage.getItem('quiz_character'));
+        const savedNickname = localStorage.getItem('quiz_nickname') || '';
+        const savedQuestionIndex = parseInt(localStorage.getItem('quiz_current_question_index') || '0', 10);
+        
+        const GAME_STATE = {
+            phase: GAME_PHASES.CUSTOMIZATION,
+            nickname: savedNickname,
+            character: loadedCharacter || defaultCharacter,
+            currentQuestionIndex: savedQuestionIndex,
+            score: parseInt(localStorage.getItem('quiz_score') || '0', 10),
+            startTime: 0, // Não persistimos o startTime, será resetado
+            endTime: 0,
+            totalTime: parseFloat(localStorage.getItem('quiz_total_time') || '0'),
+            responseTimes: [] // Não persistimos responseTimes, será resetado
+        };
+        
+        // Garante que o objeto character tem todas as novas chaves
+        if (typeof GAME_STATE.character.facialHair === 'undefined') {
+             GAME_STATE.character.facialHair = defaultCharacter.facialHair;
+             localStorage.setItem('quiz_character', JSON.stringify(GAME_STATE.character));
+        }
+
+
+
+
+
+        // Função para salvar o estado do quiz no localStorage
+        function saveGameState() {
+            localStorage.setItem('quiz_nickname', GAME_STATE.nickname);
+            localStorage.setItem('quiz_character', JSON.stringify(GAME_STATE.character));
+            localStorage.setItem('quiz_current_question_index', GAME_STATE.currentQuestionIndex.toString());
+            localStorage.setItem('quiz_score', GAME_STATE.score.toString());
+            localStorage.setItem('quiz_total_time', GAME_STATE.totalTime.toString());
+            // responseTimes não é salvo para simplificar, é só para a pontuação final
+        }
+
+
+
+
+        // --- DADOS DO QUIZ ---
+        const quizData = [
+            { q: "Qual era a principal função da literatura produzida em Angola durante o auge do colonialismo português?", a: { A: "Documentar as tradições orais e as línguas nativas antes que se perdessem.", B: "Promover a hibridização linguística entre o português e o quimbundo.", C: "Servir como ferramenta de controle cultural, perpetuando estereótipos.", D: "Focar em temas eurocêntricos como o peso da metrópole e o exílio." }, correct: 'C' },
+            { q: "Qual foi a proposta central do movimento cultural 'Vamos Descobrir Angola!', lançado em 1948?", a: { A: "Restringir a produção literária à recuperação de provérbios e lendas do folclore.", B: "Lançar uma guerrilha armada em paralelo com a produção literária.", C: "Abandonar os modelos europeus e mergulhar na realidade angolana.", D: "Obter financiamento de Portugal para publicações de autores angolanos." }, correct: 'C' },
+            { q: "A revista Mensagem, principal veículo do movimento 'Vamos Descobrir Angola!', circulava que tipo de conteúdo?", a: { A: "Ensaios sobre a superioridade da cultura portuguesa e a crítica aos modelos africanos.", B: "Textos exclusivamente em línguas bantu para legitimar a oratura.", C: "Poemas, contos e ensaios que celebravam Angola e denunciavam a opressão colonial.", D: "Análises estritamente acadêmicas sobre a história das guerras de resistência em Angola." }, correct: 'C' },
+            { q: "A literatura angolana tornou-se instrumento de denúncia das injustiças coloniais. Qual das seguintes opções NÃO era um tema central de denúncia nos textos da época?", a: { A: "O trabalho forçado.", B: "A segregação racial e a violência sistemática.", C: "A destruição das culturas tradicionais.", D: "O impacto da globalização e das novas tecnologias." }, correct: 'D' },
+            { q: "Qual é a característica fundamental da 'Revolução Linguística' no Português Angolano, que transformou a língua do colonizador em veículo de identidade angolana?", a: { A: "A rejeição total do idioma português e a escrita exclusiva nas línguas nativas.", B: "A adoção integral da norma gramatical de Lisboa para ganhar reconhecimento internacional.", C: "A incorporação de ritmos, sintaxes e expressões de línguas bantu no português.", D: "A tradução de toda a literatura colonial para línguas bantu, como o quimbundo." }, correct: 'C' },
+            { q: "Agostinho Neto, poeta e primeiro presidente de Angola, é uma das 'Vozes Fundadoras'. Sua poesia, presente em obras como Sagrada Esperança, é majoritariamente marcada por qual tema?", a: { A: "A crítica irônica aos rumos da Angola independente.", B: "A celebração do folclore e das tradições orais sem engajamento político.", C: "A denúncia da opressão colonial e a celebração da resistência.", D: "A desilusão com o período da Guerra Civil e a fragmentação social." }, correct: 'C' },
+            { q: "O romancista Pepetela é conhecido por combinar a participação na guerrilha com a produção literária. Qual é o foco temático de suas obras, como Mayombe e A Geração da Utopia?", a: { A: "A celebração incondicional da vitória da independência.", B: "A documentação estrita da vida dos colonos portugueses em Angola.", C: "A exploração da formação da nação, a desilusão pós-independência e a crítica social.", D: "A defesa da literatura como arma puramente estética, sem contexto político." }, correct: 'C' },
+            { q: "O período pós-independência (1975-2002) foi marcado pela Guerra Civil. Qual tema se tornou central na literatura angolana após esse conflito, refletindo a 'desilusão e crítica'?", a: { A: "A celebração da euforia da liberdade e do otimismo nacional.", B: "A corrupção, o autoritarismo e a desigualdade social.", C: "O trabalho forçado e a opressão da metrópole portuguesa.", D: "O impacto da globalização e das novas tecnologias." }, correct: 'B' },
+            { q: "Qual das características distintivas da Literatura Angolana descreve a convivência criativa entre português e línguas nacionais, gerando uma expressão literária única?", a: { A: "Engajamento Político.", B: "Riqueza Cultural.", C: "Identidade em Construção.", D: "Plurilinguismo." }, correct: 'D' },
+            { q: "Qual é a principal forma como as novas gerações de escritores angolanos continuam a tradição literária, de acordo com o slide?", a: { A: "Rejeitando a consciência histórica forçada pelos predecessores.", B: "Abordando temas contemporâneos (globalização, diáspora) ancorados na consciência histórica.", C: "Abandonando o português e escrevendo somente em línguas nacionais.", D: "Dedica-se exclusivamente à preservação da oratura africana, ignorando a escrita." }, correct: 'B' }
+        ];
+
+
+
+
+        // --- CONFIGURAÇÕES DO QUIZ ---
+        const TIME_LIMIT_SECONDS = 15;
+        let quizTimer;
+        let currentQuestionStartTime;
+        let globalRanking = [];
+
+
+        // --- FUNÇÕES DE UTILITY/HELPERS ---
+
+        /**
+         * Gera o SVG do personagem (boneco)
+         * @param {string} color Cor do corpo
+         * @param {string} hat Tipo de chapéu ('none', 'wizard', 'cap', ...)
+         * @param {string} facialHair Tipo de pelo facial ('none', 'mustache', 'beard', ...)
+         */
+        function generateCharacterSVG(color, hat, facialHair) {
+            let hatSvg = '';
+            const facialHairFill = '#333'; 
+
+            // --- LÓGICA DO CHAPÉU (10 opções) ---
+            switch (hat) {
+                case 'wizard':
+                    hatSvg = `
+                        <path d="M50 0 L 80 30 L 70 40 L 50 20 L 30 40 L 20 30 Z" fill="#9d174d" transform="scale(1.2) translate(0, -10)" />
+                        <path d="M50 0 L 80 30 L 70 40 L 50 20 L 30 40 L 20 30 Z" fill="#ec4899" transform="scale(1.1) translate(0, -5)" />
+                        <path d="M50 0 L 70 20 L 60 30 L 50 10 L 40 30 L 30 20 Z" fill="#db2777" />
+                    `;
+                    break;
+                case 'cap':
+                    hatSvg = `
+                        <rect x="25" y="20" width="50" height="15" rx="5" fill="#15803d"/>
+                        <path d="M50 35 C 70 35, 80 25, 75 15 L 50 15 Z" fill="#22c55e"/>
+                    `;
+                    break;
+                case 'beanie':
+                    hatSvg = `
+                        <path d="M20 35 C 20 5, 80 5, 80 35 Z" fill="#f59e0b"/>
+                        <circle cx="50" cy="10" r="4" fill="#ef4444"/>
+                    `;
+                    break;
+                case 'chef':
+                    hatSvg = `
+                        <rect x="25" y="40" width="50" height="10" fill="#bbb"/>
+                        <path d="M25 40 C 25 15, 75 15, 75 40 Z" fill="#eee"/>
+                    `;
+                    break;
+                case 'crown':
+                    hatSvg = `
+                        <path d="M30 40 L 35 25 L 45 40 L 50 25 L 55 40 L 65 25 L 70 40 Z" fill="#ffd700" stroke="#ccac00" stroke-width="1.5"/>
+                        <rect x="30" y="40" width="40" height="5" fill="#ffd700"/>
+                    `;
+                    break;
+                case 'cowboy':
+                    hatSvg = `
+                        <rect x="15" y="40" width="70" height="5" fill="#8b4513"/>
+                        <path d="M35 40 C 35 20, 65 20, 65 40 L 35 40 Z" fill="#a0522d"/>
+                    `;
+                    break;
+                case 'fedora':
+                    hatSvg = `
+                        <rect x="25" y="40" width="50" height="5" fill="#333"/>
+                        <path d="M25 40 C 25 25, 75 25, 75 40 L 50 40 L 50 20 C 50 10, 60 10, 60 20 L 60 40 Z" fill="#444"/>
+                    `;
+                    break;
+                case 'propeller':
+                    hatSvg = `
+                        <circle cx="50" cy="35" r="10" fill="#a0a0a0"/>
+                        <rect x="48" y="5" width="4" height="30" fill="#888" transform="rotate(0, 50, 20)"/>
+                        <rect x="48" y="5" width="4" height="30" fill="#888" transform="rotate(90, 50, 20)"/>
+                    `;
+                    break;
+                case 'party':
+                    hatSvg = `
+                        <polygon points="35,45 65,45 50,10" fill="#fbbd00"/>
+                        <circle cx="50" cy="8" r="3" fill="#ef4444"/>
+                    `;
+                    break;
+                case 'tophat':
+                    hatSvg = `
+                        <rect x="25" y="40" width="50" height="5" fill="#333"/>
+                        <rect x="30" y="5" width="40" height="35" fill="#444"/>
+                    `;
+                    break;
+            }
+
+            let facialHairSvg = '';
+            const facialHairOpacity = facialHair === 'stubble' ? '0.7' : '1';
+            // --- LÓGICA DO PELO FACIAL (10 opções) ---
+            switch (facialHair) {
+                case 'mustache':
+                    facialHairSvg = `
+                        <path d="M 40 70 Q 45 75, 50 70 Q 55 75, 60 70" stroke="${facialHairFill}" stroke-width="2" fill="none" opacity="${facialHairOpacity}"/>
+                        <path d="M 40 70 C 35 70, 30 65, 35 65 L 45 65 C 45 70, 40 70, 40 70 Z" fill="${facialHairFill}" opacity="${facialHairOpacity}"/>
+                        <path d="M 60 70 C 65 70, 70 65, 65 65 L 55 65 C 55 70, 60 70, 60 70 Z" fill="${facialHairFill}" opacity="${facialHairOpacity}"/>
+                    `;
+                    break;
+                case 'beard':
+                    facialHairSvg = `
+                        <path d="M 35 70 Q 50 85, 65 70 L 65 85 Q 50 95, 35 85 Z" fill="${facialHairFill}" opacity="${facialHairOpacity}"/>
+                    `;
+                    break;
+                case 'goatee':
+                    facialHairSvg = `
+                        <path d="M 45 70 Q 50 80, 55 70 L 55 85 Q 50 90, 45 85 Z" fill="${facialHairFill}" opacity="${facialHairOpacity}"/>
+                    `;
+                    break;
+                case 'handlebar':
+                    facialHairSvg = `
+                        <path d="M 35 70 C 30 65, 30 70, 35 75 L 45 75 C 45 70, 40 70, 40 70 Z" fill="${facialHairFill}" opacity="${facialHairOpacity}"/>
+                        <path d="M 65 70 C 70 65, 70 70, 65 75 L 55 75 C 55 70, 60 70, 60 70 Z" fill="${facialHairFill}" opacity="${facialHairOpacity}"/>
+                    `;
+                    break;
+                case 'soulpatch':
+                    facialHairSvg = `
+                        <circle cx="50" cy="85" r="4" fill="${facialHairFill}" opacity="${facialHairOpacity}"/>
+                    `;
+                    break;
+                case 'stubble':
+                    // Representa uma barba curta com pequenos pontos
+                    const points = [];
+                    for (let x = 30; x <= 70; x += 5) {
+                        for (let y = 70; y <= 90; y += 5) {
+                            if (Math.random() > 0.6) { // Dispersão
+                                points.push(`<circle cx="${x + Math.random() * 2 - 1}" cy="${y + Math.random() * 2 - 1}" r="0.5" fill="${facialHairFill}" opacity="0.6"/>`);
+                            }
+                        }
+                    }
+                    facialHairSvg = points.join('');
+                    break;
+                case 'anchor':
+                    facialHairSvg = `
+                        <path d="M 45 70 L 55 70 L 55 85 Q 50 90, 45 85 Z" fill="${facialHairFill}" opacity="${facialHairOpacity}"/>
+                        <path d="M 40 70 C 45 75, 50 75, 55 70" stroke="${facialHairFill}" stroke-width="2" fill="none" opacity="${facialHairOpacity}"/>
+                    `;
+                    break;
+                case 'vandyke':
+                    facialHairSvg = `
+                        <path d="M 40 70 C 45 75, 50 75, 55 70" stroke="${facialHairFill}" stroke-width="2" fill="none" opacity="${facialHairOpacity}"/>
+                        <path d="M 47 75 L 53 75 L 53 90 Q 50 95, 47 90 Z" fill="${facialHairFill}" opacity="${facialHairOpacity}"/>
+                    `;
+                    break;
+                case 'sideburns':
+                    facialHairSvg = `
+                        <rect x="30" y="60" width="5" height="15" fill="${facialHairFill}" opacity="${facialHairOpacity}"/>
+                        <rect x="65" y="60" width="5" height="15" fill="${facialHairFill}" opacity="${facialHairOpacity}"/>
+                        <!-- Conecta as costeletas com uma linha fina na mandíbula -->
+                        <path d="M35 75 C 40 80, 60 80, 65 75" stroke="${facialHairFill}" stroke-width="1.5" fill="none" opacity="${facialHairOpacity}"/>
+                    `;
+                    break;
+                case 'fullbeard':
+                     facialHairSvg = `
+                        <path d="M 35 70 Q 50 85, 65 70 L 65 90 Q 50 100, 35 90 Z" fill="${facialHairFill}" opacity="${facialHairOpacity}"/>
+                     `;
+                    break;
+            }
+
+
+            return `
+                <svg viewBox="0 0 100 100" class="w-24 h-24" xmlns="http://www.w3.org/2000/svg">
+                    <!-- Chapéu -->
+                    ${hatSvg}
+                    <!-- Corpo (Círculo) -->
+                    <circle cx="50" cy="65" r="30" fill="${color}" stroke="#333" stroke-width="2"/>
+                    <!-- Olhos -->
+                    <circle cx="40" cy="60" r="3" fill="#333"/>
+                    <circle cx="60" cy="60" r="3" fill="#333"/>
+                    <!-- Sorriso (só se não houver pelo facial cobrindo a boca) -->
+                    ${(facialHair === 'none' || facialHair === 'goatee' || facialHair === 'soulpatch' || facialHair === 'sideburns') ? '<path d="M 40 75 Q 50 85, 60 75" stroke="#333" stroke-width="2" fill="none"/>' : ''}
+                    <!-- Pelos Faciais -->
+                    ${facialHairSvg}
+                </svg>
+            `;
+        }
+
+        /**
+         * Formata o tempo total em segundos para Minutos:Segundos.
+         * @param {number} totalSeconds
+         * @returns {string}
+         */
+        function formatTime(totalSeconds) {
+            const minutes = Math.floor(totalSeconds / 60);
+            const seconds = Math.round(totalSeconds % 60);
+            return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        }
+
+        /**
+         * Exibe uma mensagem flutuante (não usar alert/confirm)
+         * @param {string} message
+         * @param {string} type ('success', 'error', 'info')
+         */
+        function showMessage(message, type = 'info') {
+            // Remove mensagens existentes para evitar sobreposição
+            document.querySelectorAll('.app-message-box').forEach(el => el.remove());
+
+            let color = 'bg-blue-500';
+            if (type === 'error') color = 'bg-red-500';
+            if (type === 'success') color = 'bg-green-500';
+
+            const messageBox = document.createElement('div');
+            messageBox.className = `app-message-box ${color} text-white p-3 rounded-lg shadow-xl fixed top-5 left-1/2 transform -translate-x-1/2 z-50 transition-opacity duration-300 opacity-0 text-sm sm:text-base font-semibold`;
+            messageBox.textContent = message;
+            document.body.appendChild(messageBox); // Anexar ao body para garantir que esteja acima de tudo
+
+            setTimeout(() => {
+                messageBox.classList.remove('opacity-0');
+            }, 10);
+
+            setTimeout(() => {
+                messageBox.classList.add('opacity-0');
+                messageBox.addEventListener('transitionend', () => messageBox.remove());
+            }, 4000);
+        }
+        
+        /**
+         * Limpa todo o estado salvo no localStorage E recarrega a página.
+         */
+        function resetGameState() {
+            localStorage.removeItem('quiz_nickname');
+            localStorage.removeItem('quiz_character');
+            localStorage.removeItem('quiz_current_question_index');
+            localStorage.removeItem('quiz_score');
+            localStorage.removeItem('quiz_total_time');
+            
+            // Recarrega a página para reiniciar completamente o jogo
+            window.location.reload();
+        }
+
+        // --- FUNÇÕES DE FIREBASE / DADOS ---
+
+        async function initFirebase() {
+            try {
+                // 1. Verificar se a configuração é a Mock (Modo Local)
+                if (firebaseConfig.apiKey === MOCK_API_KEY) {
+                    isFirestoreReady = false;
+                    console.warn("MODO LOCAL ATIVADO: Firestore/Ranking desativado. Chaves de API ausentes.");
+                } else {
+                    // 2. Tentar inicializar Firebase com a configuração do ambiente (SÓ NO CANVAS)
+                    const app = initializeApp(firebaseConfig);
+                    auth = getAuth(app);
+                    db = getFirestore(app);
+                    isFirestoreReady = true; // BD pronta para tentar salvar/ler
+
+                    // 3. Autenticação 
+                    if (initialAuthToken && initialAuthToken !== 'MOCK_TOKEN') {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                }
+
+
+
+
+                // 4. Configurar o estado de autenticação (mesmo que seja anónimo/local)
+                if (!isFirestoreReady) {
+                    // SE ESTIVER NO MODO LOCAL: Simula o estado de autenticação para iniciar o jogo
+                    userId = 'anon-local-' + (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15));
+                    isAuthReady = true;
+                    console.log('Executando em Modo Local. Usuário:', userId);
+                } else {
+                     // SE ESTIVER COM CHAVES VÁLIDAS: Usa o listener do Firebase
+                    onAuthStateChanged(auth, (user) => {
+                        if (user) {
+                            userId = user.uid;
+                            isAuthReady = true;
+                            console.log('Firebase Auth pronto. Usuário:', userId);
+                        } else {
+                            console.error("Falha ao autenticar, a executar anónimamente.");
+                            isAuthReady = true;
+                            userId = 'anon-' + (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15));
+                        }
+                    });
+                }
+                
+                // 5. Determinar a fase inicial e renderizar
+                const determinePhase = () => {
+                    // Checa se o quiz foi concluído na última jogada
+                    const isGameFinished = GAME_STATE.currentQuestionIndex >= quizData.length;
+
+                    // CORREÇÃO: Se o jogo foi concluído ou não há nickname, força para CUSTOMIZATION
+                    if (isGameFinished) {
+                        // Resetamos o estado temporário para uma nova jogada
+                        GAME_STATE.currentQuestionIndex = 0;
+                        GAME_STATE.score = 0;
+                        GAME_STATE.responseTimes = [];
+                        saveGameState(); // Salva o reset
+                    }
+
+                    if (GAME_STATE.nickname && GAME_STATE.currentQuestionIndex > 0) {
+                        // Se houver nickname E não estiver na primeira pergunta, resume o Quiz
+                        GAME_STATE.phase = GAME_PHASES.QUIZ;
+                        startQuiz();
+                    } else if (GAME_STATE.nickname) {
+                        // Se houver nickname, mas é uma nova jogada (index 0), vai para NICKNAME
+                        // Isso permite que o usuário pule o Customization se quiser, mas ainda o veja.
+                        GAME_STATE.phase = GAME_PHASES.NICKNAME; 
+                    } else {
+                        // Se não houver nickname, começa pela personalização
+                        GAME_STATE.phase = GAME_PHASES.CUSTOMIZATION;
+                    }
+
+
+                    renderUI();
+
+                    // Inicia o listener de ranking se estivermos na fase correta E a BD estiver pronta
+                    if (GAME_STATE.phase === GAME_PHASES.RANKING && isFirestoreReady) {
+                        listenToRanking();
+                    } else if (GAME_STATE.phase === GAME_PHASES.RANKING && !isFirestoreReady) {
+                         showMessage("Ranking indisponível no modo local.", 'info');
+                         renderRanking(); // Renderiza o ranking, mas estará vazio
+                    }
+                };
+                
+                // Espera pelo estado de autenticação se estivermos a usar o Firebase completo
+                if (isFirestoreReady) {
+                     // O listener onAuthStateChanged cuidará de chamar determinePhase
+                     const unsubscribe = onAuthStateChanged(auth, (user) => {
+                        if (user) {
+                            determinePhase();
+                            unsubscribe(); // Roda uma vez e desativa
+                        }
+                    });
+                } else {
+                    // Se estivermos no Modo Local, podemos determinar a fase imediatamente
+                    determinePhase();
+                }
+
+            } catch (error) {
+                // CAPTURA DE ERRO CRÍTICO 
+                console.error("Erro na inicialização do Firebase (provável API Key inválida):", error.message);
+                showMessage(`Erro Crítico: O Ranking foi desativado. Jogue no Modo Local.`, 'error');
+
+                // Força o modo local para continuar o jogo sem o Ranking
+                isFirestoreReady = false;
+                userId = 'anon-fallback-' + (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15));
+                isAuthReady = true;
+                
+                // Continua o jogo ignorando o Ranking
+                const isGameFinished = GAME_STATE.currentQuestionIndex >= quizData.length;
+                if (isGameFinished) {
+                    GAME_STATE.currentQuestionIndex = 0;
+                    GAME_STATE.score = 0;
+                    GAME_STATE.responseTimes = [];
+                    saveGameState();
+                }
+
+                if (GAME_STATE.nickname) {
+                    GAME_STATE.phase = GAME_PHASES.NICKNAME; // Vai para Nickname
+                } else {
+                    GAME_STATE.phase = GAME_PHASES.CUSTOMIZATION;
+                }
+                renderUI();
+            }
+        }
+
+
+
+
+
+
+        /**
+         * Checa se o nickname é único no Firestore.
+         */
+        async function checkNicknameUniqueness(nickname) {
+            // PONTO DE INTEGRAÇÃO FIREBASE: Comente ou remova no GitHub.
+            if (!isFirestoreReady) {
+                console.warn("Verificação de Nickname pulada (Modo Local).");
+                return true; // Assume único no modo local
+            }
+            try {
+                const rankingRef = collection(db, `/artifacts/${appId}/public/data/quiz_ranking`);
+                const q = query(rankingRef, where("nickname", "==", nickname.trim()), limit(1));
+                const querySnapshot = await getDocs(q);
+                return querySnapshot.empty;
+            } catch (e) {
+                console.error("Erro ao verificar nickname:", e);
+                showMessage("Erro ao checar o nickname. Tente novamente.", 'error');
+                return false;
+            }
+        }
+
+
+
+
+
+        
+        /**
+         * Salva o score do jogador no ranking público.
+         */
+        async function saveScore() {
+             // PONTO DE INTEGRAÇÃO FIREBASE: Comente ou remova no GitHub.
+            if (!isFirestoreReady) {
+                showMessage("Score guardado localmente, Ranking não atualizado (Modo Local).", 'info');
+                return;
+            }
+            if (!GAME_STATE.nickname) return;
+            
+            try {
+                const rankingCollectionRef = collection(db, `/artifacts/${appId}/public/data/quiz_ranking`);
+                const scoreDocRef = doc(rankingCollectionRef, userId); 
+
+                await setDoc(scoreDocRef, {
+                    userId: userId,
+                    nickname: GAME_STATE.nickname,
+                    score: GAME_STATE.score,
+                    totalTime: GAME_STATE.totalTime,
+                    responseTimes: GAME_STATE.responseTimes,
+                    timestamp: serverTimestamp(),
+                    character: GAME_STATE.character // O objeto character agora inclui facialHair
+                }, { merge: true });
+
+                console.log("Score salvo com sucesso!");
+            } catch (e) {
+                console.error("Erro ao salvar o score:", e);
+                showMessage("Falha ao salvar o ranking. Tente novamente.", 'error');
+            }
+        }
+
+        /**
+         * Listener para o ranking global.
+         */
+        function listenToRanking() {
+            // PONTO DE INTEGRAÇÃO FIREBASE: Comente ou remova no GitHub.
+            if (!isFirestoreReady) return;
+
+            const rankingRef = collection(db, `/artifacts/${appId}/public/data/quiz_ranking`);
+            const q = query(rankingRef, limit(20));
+
+            onSnapshot(q, (snapshot) => {
+                let rawRanking = snapshot.docs.map(doc => ({
+                    id: doc.id,
+                    ...doc.data(),
+                }));
+                
+                // Ordenação em JavaScript (em memória) para evitar erro de índice no Firestore
+                rawRanking.sort((a, b) => {
+                    if (a.score !== b.score) {
+                        return b.score - a.score;
+                    }
+                    return (a.totalTime || 0) - (b.totalTime || 0);
+                });
+
+                globalRanking = rawRanking.map(player => ({
+                     ...player,
+                    formattedTime: formatTime(player.totalTime || 0)
+                })).slice(0, 10);
+
+                if (GAME_STATE.phase === GAME_PHASES.RANKING) {
+                    renderRanking();
+                }
+            }, (error) => {
+                console.error("Erro ao carregar ranking:", error);
+                showMessage("Não foi possível carregar o ranking em tempo real.", 'error');
+            });
+        }
+
+
+        // --- LÓGICA DO QUIZ ---
+
+        function startQuiz() {
+            if (GAME_STATE.phase !== GAME_PHASES.QUIZ) return;
+            // Se o índice for 0, é uma nova partida. Se for > 0, estamos a resumir.
+            if (GAME_STATE.currentQuestionIndex === 0) {
+                 GAME_STATE.score = 0;
+                 GAME_STATE.responseTimes = [];
+            }
+            GAME_STATE.startTime = Date.now();
+            currentQuestionStartTime = Date.now();
+            renderQuestion();
+        }
+
+        function startQuestionTimer() {
+            if (quizTimer) clearInterval(quizTimer);
+            
+            const timerDisplay = document.getElementById('timer-bar-fill');
+            const timerText = document.getElementById('timer-text');
+            if (!timerDisplay || !timerText) return;
+            
+            let timeLeft = TIME_LIMIT_SECONDS;
+            timerDisplay.style.width = '100%';
+            timerDisplay.classList.remove('bg-red-500', 'bg-yellow-500');
+            timerDisplay.classList.add('bg-green-500');
+            timerText.textContent = `${timeLeft}s`;
+
+            quizTimer = setInterval(() => {
+                timeLeft--;
+                const percentage = (timeLeft / TIME_LIMIT_SECONDS) * 100;
+                timerDisplay.style.width = `${percentage}%`;
+                timerText.textContent = `${timeLeft}s`;
+
+                if (timeLeft <= 5) {
+                    timerDisplay.classList.remove('bg-green-500', 'bg-yellow-500');
+                    timerDisplay.classList.add('bg-red-500');
+                } else if (timeLeft <= 10) {
+                    timerDisplay.classList.remove('bg-green-500');
+                    timerDisplay.classList.add('bg-yellow-500');
+                }
+
+                if (timeLeft <= 0) {
+                    clearInterval(quizTimer);
+                    showMessage("Tempo esgotado!", 'error');
+                    processAnswer(null); // Resposta nula = erro
+                }
+            }, 1000);
+        }
+
+        function handleAnswer(selectedOption) {
+            // Desativa todos os botões de resposta
+            clearInterval(quizTimer);
+            document.querySelectorAll('.answer-button').forEach(btn => {
+                btn.classList.add('disabled', 'pointer-events-none');
+            });
+            
+            const selectedBtn = document.getElementById(`btn-${selectedOption}`);
+            const currentQ = quizData[GAME_STATE.currentQuestionIndex];
+            const isCorrect = selectedOption === currentQ.correct;
+            
+            // Marca a resposta visualmente
+            selectedBtn.classList.remove('hover:bg-blue-50');
+            if (isCorrect) {
+                selectedBtn.classList.add('bg-green-200', 'border-green-500');
+                showMessage("Resposta Correta!", 'success');
+            } else {
+                selectedBtn.classList.add('bg-red-200', 'border-red-500', 'shake');
+                showMessage("Resposta Incorreta!", 'error');
+                // Revela a correta
+                const correctBtn = document.getElementById(`btn-${currentQ.correct}`);
+                if(correctBtn) {
+                     correctBtn.classList.add('bg-green-300', 'border-green-600', 'font-bold');
+                }
+            }
+
+            // Dá um pequeno atraso antes de processar e ir para a próxima
+            setTimeout(() => processAnswer(selectedOption), 1500);
+        }
+
+        function processAnswer(selectedOption) {
+            const currentQ = quizData[GAME_STATE.currentQuestionIndex];
+            const isCorrect = selectedOption === currentQ.correct;
+
+            const timeTaken = (Date.now() - currentQuestionStartTime) / 1000;
+            GAME_STATE.responseTimes.push(timeTaken);
+
+            if (isCorrect) {
+                GAME_STATE.score++;
+            }
+
+            // Vai para a próxima pergunta ou finaliza
+            GAME_STATE.currentQuestionIndex++;
+            saveGameState(); // Salva o estado após cada resposta
+
+            if (GAME_STATE.currentQuestionIndex < quizData.length) {
+                currentQuestionStartTime = Date.now(); // Reinicia o tempo para a próxima
+                renderQuestion();
+            } else {
+                finishQuiz();
+            }
+        }
+
+        function finishQuiz() {
+            clearInterval(quizTimer);
+            GAME_STATE.endTime = Date.now();
+            
+            // Calcula o tempo real da resposta (só a soma do tempo das respostas)
+            const calculatedTotalTime = GAME_STATE.responseTimes.reduce((sum, time) => sum + time, 0);
+            GAME_STATE.totalTime = parseFloat(calculatedTotalTime.toFixed(2));
+            
+            saveGameState(); // Salva o tempo final e o estado
+
+            // Salva o score e muda para a fase de ranking
+            saveScore(); // Esta função é ignorada se estiver no Modo Local
+            GAME_STATE.phase = GAME_PHASES.RANKING;
+            
+            if (isFirestoreReady) {
+                listenToRanking();
+            }
+            
+            renderUI();
+        }
+
+        // --- FUNÇÕES DE RENDERIZAÇÃO DE FASES ---
+
+        function renderUI() {
+            const contentDiv = document.getElementById('game-content');
+            
+            // Garante que o usuário veja seu ID
+            document.getElementById('app-container').classList.remove('hidden');
+
+            switch (GAME_STATE.phase) {
+                case GAME_PHASES.CUSTOMIZATION:
+                    renderCustomization(contentDiv);
+                    break;
+                case GAME_PHASES.NICKNAME:
+                    renderNicknameInput(contentDiv);
+                    break;
+                case GAME_PHASES.QUIZ:
+                    renderQuestion(contentDiv);
+                    break;
+                case GAME_PHASES.RANKING:
+                    renderRanking(contentDiv);
+                    break;
+                default:
+                    // Caso inicial antes do auth
+                    contentDiv.innerHTML = '<h1 class="text-3xl font-extrabold text-gray-800 mb-4">Carregando Jogo...</h1><p class="text-gray-500">Aguarde a autenticação.</p>';
+            }
+        }
+
+        function renderCustomization(contentDiv) {
+            contentDiv.className = "min-h-[400px] flex flex-col justify-center items-center text-center p-2 sm:p-0";
+            
+            // --- 10 CORES ---
+            const colors = [
+                '#f59e0b', '#10b981', '#ef4444', '#3b82f6', '#8b5cf6', 
+                '#d946ef', '#2dd4bf', '#fb7185', '#0f766e', '#78350f'
+            ];
+            
+            // --- 10 CHAPÉUS ---
+            const hats = [
+                { id: 'none', label: 'Nenhum' }, { id: 'cap', label: 'Boné' }, { id: 'wizard', label: 'Feiticeiro' }, 
+                { id: 'beanie', label: 'Gorro' }, { id: 'chef', label: 'Chef' }, { id: 'crown', label: 'Coroa' }, 
+                { id: 'cowboy', label: 'Caubói' }, { id: 'fedora', label: 'Fedora' }, { id: 'propeller', label: 'Hélice' }, 
+                { id: 'party', label: 'Festa' }
+            ];
+            
+            // --- 10 PELOS FACIAIS ---
+            const facialHairs = [
+                { id: 'none', label: 'Nenhum' }, { id: 'mustache', label: 'Bigode Fino' }, { id: 'beard', label: 'Barba Cheia' }, 
+                { id: 'goatee', label: 'Cavanhaque' }, { id: 'handlebar', label: 'Bigode Guidão' }, { id: 'soulpatch', label: 'Pêra' }, 
+                { id: 'stubble', label: 'Barba Curta' }, { id: 'anchor', label: 'Âncora' }, { id: 'vandyke', label: 'Vandyke' }, 
+                { id: 'sideburns', label: 'Costeletas' }
+            ];
+
+            contentDiv.innerHTML = `
+                <h1 class="text-3xl sm:text-4xl font-extrabold text-gray-800 mb-6">1. Personalize Seu Boneco</h1>
+                
+                <div id="character-preview" class="mb-8 p-4 bg-gray-50 rounded-lg border border-gray-200">
+                    ${generateCharacterSVG(GAME_STATE.character.color, GAME_STATE.character.hat, GAME_STATE.character.facialHair)}
+                </div>
+
+                <div class="w-full max-w-lg space-y-6">
+                    <!-- Cor Principal (10 opções) -->
+                    <div>
+                        <h2 class="text-xl font-semibold text-gray-700 mb-3">Cor Principal:</h2>
+                        <div id="color-selector" class="flex flex-wrap justify-center gap-3">
+                            ${colors.map(c => `
+                                <button data-color="${c}" class="w-8 h-8 rounded-full border-4 ${GAME_STATE.character.color === c ? 'border-indigo-600 ring-2 ring-indigo-300' : 'border-gray-200 hover:border-indigo-400'} transition-all" style="background-color: ${c};"></button>
+                            `).join('')}
+                        </div>
+                    </div>
+                    
+                    <!-- Acessório de Cabeça (10 opções) -->
+                    <div>
+                        <h2 class="text-xl font-semibold text-gray-700 mb-3">Chapéu:</h2>
+                        <div id="hat-selector" class="flex flex-wrap justify-center gap-2">
+                            ${hats.map(h => `
+                                <button data-hat="${h.id}" class="py-2 px-3 rounded-full text-xs sm:text-sm font-medium transition-colors ${GAME_STATE.character.hat === h.id ? 'bg-indigo-600 text-white shadow-md' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}">${h.label}</button>
+                            `).join('')}
+                        </div>
+                    </div>
+                    
+                    <!-- Pelo Facial (10 opções) -->
+                    <div>
+                        <h2 class="text-xl font-semibold text-gray-700 mb-3">Pelo Facial:</h2>
+                        <div id="facial-hair-selector" class="flex flex-wrap justify-center gap-2">
+                            ${facialHairs.map(f => `
+                                <button data-facial-hair="${f.id}" class="py-2 px-3 rounded-full text-xs sm:text-sm font-medium transition-colors ${GAME_STATE.character.facialHair === f.id ? 'bg-indigo-600 text-white shadow-md' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}">${f.label}</button>
+                            `).join('')}
+                        </div>
+                    </div>
+                    
+                    <div class="flex flex-col sm:flex-row justify-between gap-4 mt-8">
+                        <button id="reset-game-btn" onclick="resetGameState()" class="flex-1 bg-red-100 text-red-600 py-3 rounded-xl font-bold text-sm hover:bg-red-200 transition-colors shadow-md border border-red-300">
+                            Reiniciar Tudo (Limpar Nick)
+                        </button>
+                        <button id="next-to-nickname" class="flex-1 bg-blue-600 text-white py-3 rounded-xl font-bold text-lg hover:bg-blue-700 transition-colors shadow-lg">
+                            Próximo: Nickname
+                        </button>
+                    </div>
+                </div>
+            `;
+
+            // Adiciona listeners de eventos
+            const updateCharacterState = (key, value) => {
+                GAME_STATE.character[key] = value;
+                saveGameState(); // Salva no localStorage imediatamente
+                renderCustomization(document.getElementById('game-content')); // Re-renderiza para atualizar o preview e seleção
+            };
+
+            document.getElementById('color-selector').addEventListener('click', (e) => {
+                const color = e.target.dataset.color;
+                if (color) { updateCharacterState('color', color); }
+            });
+
+            document.getElementById('hat-selector').addEventListener('click', (e) => {
+                const hat = e.target.closest('button')?.dataset.hat;
+                if (hat) { updateCharacterState('hat', hat); }
+            });
+
+            document.getElementById('facial-hair-selector').addEventListener('click', (e) => {
+                const facialHair = e.target.closest('button')?.dataset.facialHair;
+                if (facialHair) { updateCharacterState('facialHair', facialHair); }
+            });
+
+            document.getElementById('next-to-nickname').addEventListener('click', () => {
+                GAME_STATE.phase = GAME_PHASES.NICKNAME;
+                renderUI();
+            });
+        }
+
+        function renderNicknameInput(contentDiv) {
+            contentDiv.className = "min-h-[400px] flex flex-col justify-center items-center text-center p-2 sm:p-0";
+            contentDiv.innerHTML = `
+                <h1 class="text-3xl sm:text-4xl font-extrabold text-gray-800 mb-6">2. Escolha Seu Nickname</h1>
+                
+                <div class="mb-6 cursor-pointer" id="change-character-btn">
+                    ${generateCharacterSVG(GAME_STATE.character.color, GAME_STATE.character.hat, GAME_STATE.character.facialHair)}
+                    <p class="text-sm text-blue-500 mt-2 hover:underline">Clique para mudar o boneco</p>
+                </div>
+
+                <div class="w-full max-w-sm p-6 border-4 border-dashed border-blue-400 rounded-xl bg-blue-50">
+                    <label for="nickname-input" class="block text-lg font-medium text-gray-700 mb-2">Digite seu Nick:</label>
+                    <input type="text" id="nickname-input" value="${GAME_STATE.nickname}"
+                           class="w-full px-4 py-3 border border-gray-300 rounded-lg text-center text-xl font-semibold focus:ring-blue-500 focus:border-blue-500 transition-all"
+                           placeholder="Ex: ExploradorAngola" maxlength="20">
+                    <p id="nickname-message" class="text-sm text-gray-500 mt-2 min-h-[20px]"></p>
+                </div>
+
+                <button id="start-quiz-btn" class="mt-8 w-full max-w-sm bg-green-600 text-white py-3 rounded-xl font-bold text-lg hover:bg-green-700 transition-colors shadow-lg disabled:opacity-50" disabled>
+                    Iniciar Quiz
+                </button>
+            `;
+
+            const input = document.getElementById('nickname-input');
+            const button = document.getElementById('start-quiz-btn');
+            const message = document.getElementById('nickname-message');
+            let debounceTimeout;
+
+            // Função de validação
+            const validateNickname = async (e) => {
+                const newNickname = e.target.value.trim();
+                
+                if (newNickname.length < 3) {
+                    message.textContent = "Mínimo de 3 caracteres.";
+                    message.classList.remove('text-green-600');
+                    message.classList.add('text-red-600');
+                    button.disabled = true;
+                    return;
+                }
+                
+                // Se o nickname não mudou e é válido, mantém o estado
+                if (newNickname === GAME_STATE.nickname) {
+                    message.textContent = "Nickname salvo. Pronto para começar.";
+                    message.classList.remove('text-red-600');
+                    message.classList.add('text-green-600');
+                    button.disabled = false;
+                    return;
+                }
+
+                message.textContent = isFirestoreReady ? "Verificando unicidade..." : "Verificação pulada (Modo Local)...";
+                message.classList.remove('text-green-600', 'text-red-600');
+                
+                clearTimeout(debounceTimeout);
+                debounceTimeout = setTimeout(async () => {
+                    const isUnique = await checkNicknameUniqueness(newNickname);
+                    
+                    if (isUnique) {
+                        message.textContent = "Nickname disponível!";
+                        message.classList.remove('text-red-600');
+                        message.classList.add('text-green-600');
+                        button.disabled = false;
+                        GAME_STATE.nickname = newNickname;
+                        saveGameState(); // Salva o novo nickname
+                    } else {
+                        message.textContent = "Este Nickname já está em uso.";
+                        message.classList.remove('text-green-600');
+                        message.classList.add('text-red-600');
+                        button.disabled = true;
+                    }
+                }, 500);
+            };
+
+            input.addEventListener('input', validateNickname);
+            document.getElementById('change-character-btn').addEventListener('click', () => {
+                 GAME_STATE.phase = GAME_PHASES.CUSTOMIZATION;
+                 renderUI();
+            });
+            
+            // Valida o valor inicial, se houver
+            if (GAME_STATE.nickname) {
+                validateNickname({ target: input });
+            } else {
+                button.disabled = true;
+            }
+
+            button.addEventListener('click', () => {
+                if (GAME_STATE.nickname && !button.disabled) {
+                    GAME_STATE.phase = GAME_PHASES.QUIZ;
+                    startQuiz();
+                } else {
+                    showMessage("Por favor, escolha um nickname válido e único.", 'error');
+                }
+            });
+        }
+
+        function renderQuestion(contentDiv = document.getElementById('game-content')) {
+            if (GAME_STATE.currentQuestionIndex >= quizData.length) {
+                return finishQuiz();
+            }
+            
+            contentDiv.className = "min-h-[400px] flex flex-col items-center p-2 sm:p-0";
+            const currentQ = quizData[GAME_STATE.currentQuestionIndex];
+            const qNumber = GAME_STATE.currentQuestionIndex + 1;
+
+            contentDiv.innerHTML = `
+                <!-- Estatísticas e Timer -->
+                <div class="w-full flex justify-between items-center mb-6 p-3 bg-gray-100 rounded-xl shadow-inner text-sm sm:text-lg">
+                    <p class="font-bold text-gray-700">
+                        <span class="text-blue-600 truncate">${GAME_STATE.nickname}</span> | Score: <span class="text-green-600">${GAME_STATE.score}</span>
+                    </p>
+                    <p class="font-bold text-gray-700">
+                        Pergunta: ${qNumber}/${quizData.length}
+                    </p>
+                </div>
+                
+                <!-- Barra de Tempo -->
+                <div class="w-full mb-8">
+                    <div class="h-6 sm:h-8 bg-gray-200 rounded-full relative overflow-hidden">
+                        <div id="timer-bar-fill" class="h-full bg-green-500 transition-all duration-1000 ease-linear" style="width: 100%;"></div>
+                        <span id="timer-text" class="absolute inset-0 flex items-center justify-center font-extrabold text-white text-base sm:text-xl">15s</span>
+                    </div>
+                </div>
+
+                <!-- Pergunta -->
+                <div class="bg-blue-600 text-white p-5 rounded-xl mb-8 w-full shadow-lg">
+                    <h2 class="text-xl md:text-2xl font-bold">${currentQ.q}</h2>
+                </div>
+
+                <!-- Alternativas -->
+                <div id="answers-container" class="w-full grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-4">
+                    ${Object.entries(currentQ.a).map(([key, value]) => `
+                        <button id="btn-${key}" data-answer="${key}"
+                                class="answer-button w-full text-left p-3 sm:p-4 border-2 border-gray-300 rounded-xl bg-white text-gray-800 text-sm sm:text-base font-medium hover:bg-blue-50 transition-all duration-200">
+                            <span class="font-extrabold text-blue-600 mr-2">${key}.</span> ${value}
+                        </button>
+                    `).join('')}
+                </div>
+            `;
+            
+            // Adiciona listeners para as respostas e inicia o timer
+            document.getElementById('answers-container').addEventListener('click', (e) => {
+                const button = e.target.closest('.answer-button');
+                if (button && !button.classList.contains('disabled')) {
+                    handleAnswer(button.dataset.answer);
+                }
+            });
+
+            startQuestionTimer();
+        }
+
+        function renderRanking(contentDiv = document.getElementById('game-content')) {
+            contentDiv.className = "min-h-[400px] flex flex-col items-center text-center p-2 sm:p-0";
+            
+            const totalQuestions = quizData.length;
+            const finalScoreHTML = GAME_STATE.currentQuestionIndex === totalQuestions ? `
+                <div class="mb-8 p-6 bg-green-100 border-b-4 border-green-600 rounded-xl shadow-lg w-full">
+                    <h2 class="text-3xl font-extrabold text-green-700 mb-2">Quiz Finalizado!</h2>
+                    <p class="text-xl font-medium text-gray-700">
+                        Você acertou <span class="text-green-600 font-bold">${GAME_STATE.score}</span> de ${totalQuestions} perguntas.
+                    </p>
+                    <p class="text-lg font-medium text-gray-700">
+                        Tempo Total: <span class="font-bold">${formatTime(GAME_STATE.totalTime)}</span>
+                    </p>
+                </div>
+            ` : '';
+
+            let rankingStatus = '';
+            // AVISO CLARO SOBRE O MODO LOCAL 
+            if (!isFirestoreReady) {
+                 rankingStatus = '<p class="text-red-500 mb-4 font-semibold p-2 bg-red-50 rounded-lg">AVISO: O Ranking está desativado. Jogue no Modo Local (Chaves de API ausentes).</p>';
+            }
+
+            const rankingListHTML = globalRanking.length === 0 && isFirestoreReady ? 
+                '<p class="text-gray-500">Carregando Ranking...</p>' : 
+                globalRanking.map((player, index) => {
+                    const isCurrentUser = player.userId === userId;
+                    const bgClass = isCurrentUser ? 'bg-yellow-100 border-yellow-500' : 'bg-white border-gray-200';
+                    const rankColor = index === 0 ? 'text-yellow-600' : index === 1 ? 'text-gray-500' : index === 2 ? 'text-yellow-800' : 'text-gray-600';
+                    const isHidden = isCurrentUser && globalRanking.length > 10 && index >= 10;
+                    
+                    // Estrutura responsiva para o item da lista
+                    return isHidden ? '' : `
+                        <li class="flex flex-col sm:flex-row items-start sm:items-center justify-between p-4 mb-2 rounded-lg border-2 ${bgClass} shadow-md transition-shadow duration-300">
+                            <div class="flex items-center space-x-4 mb-2 sm:mb-0">
+                                ${generateCharacterSVG(player.character?.color || '#3b82f6', player.character?.hat || 'none', player.character?.facialHair || 'none')}
+                                <div>
+                                    <span class="text-xl font-extrabold ${rankColor}">#${index + 1}</span>
+                                    <p class="text-xl font-bold ${isCurrentUser ? 'text-indigo-700' : 'text-gray-800'}">${player.nickname} ${isCurrentUser ? '(Você)' : ''}</p>
+                                    <p class="text-sm text-gray-500 break-all truncate max-w-[200px] sm:max-w-none">ID: ${player.userId}</p>
+                                </div>
+                            </div>
+                            <div class="text-left sm:text-right w-full sm:w-auto mt-2 pt-2 border-t sm:border-t-0 border-gray-200 sm:mt-0 sm:pt-0">
+                                <p class="text-lg font-bold text-green-600">${player.score} Acertos</p>
+                                <p class="text-base font-medium text-gray-700">Tempo: ${player.formattedTime}</p>
+                            </div>
+                        </li>
+                    `;
+                }).join('');
+
+            contentDiv.innerHTML = `
+                ${finalScoreHTML}
+                
+                <h1 class="text-4xl font-extrabold text-gray-800 mb-6">Ranking Global</h1>
+                ${rankingStatus}
+
+                <ul class="w-full max-w-xl">
+                    ${rankingListHTML || '<p class="text-gray-500">Nenhum dado de ranking para exibir. Jogue no Modo Local.</p>'}
+                </ul>
+
+                <div class="mt-8 w-full max-w-sm flex flex-col space-y-3">
+                    <button onclick="resetGameState()" class="w-full bg-blue-600 text-white py-3 rounded-xl font-bold text-lg hover:bg-blue-700 transition-colors shadow-lg">
+                        Reiniciar Jogo (Limpar Nickname)
+                    </button>
+                    <button onclick="window.location.reload()" class="w-full bg-gray-200 text-gray-700 py-3 rounded-xl font-bold text-lg hover:bg-gray-300 transition-colors shadow-md">
+                        Jogar Novamente (Manter Nick)
+                    </button>
+                </div>
+            `;
+        }
+
+        // --- INICIALIZAÇÃO ---
+        window.onload = initFirebase;
+        // Tornando as funções acessíveis globalmente para os botões inline
+        window.formatTime = formatTime;
+        window.resetGameState = resetGameState;
+
+    </script>
+</body>
+</html>
